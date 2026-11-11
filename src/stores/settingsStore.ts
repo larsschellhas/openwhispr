@@ -521,6 +521,7 @@ const BOOLEAN_SETTINGS = new Set([
   "toneStyleEnabled",
   "useDictationAgent",
   "keepLocalModelLoaded",
+  "unloadTranscriptionModelWhenIdle",
   "voiceAgentScreenContext",
   "useDictationAgentVisionModel",
   "useDictationTranslation",
@@ -1191,6 +1192,7 @@ export interface SettingsState
   cleanupMode: InferenceMode;
   cleanupRemoteUrl: string;
   keepLocalModelLoaded: boolean;
+  unloadTranscriptionModelWhenIdle: boolean;
 
   meetingTranscriptionMode: InferenceMode;
   meetingUseLocalWhisper: boolean;
@@ -1314,6 +1316,7 @@ export interface SettingsState
   setCleanupMode: (mode: InferenceMode) => void;
   setCleanupRemoteUrl: (url: string) => void;
   setKeepLocalModelLoaded: (value: boolean) => void;
+  setUnloadTranscriptionModelWhenIdle: (value: boolean) => void;
 
   setMeetingTranscriptionMode: (mode: InferenceMode) => void;
   setMeetingUseLocalWhisper: (value: boolean) => void;
@@ -2014,6 +2017,7 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
   })(),
   cleanupRemoteUrl: readString("cleanupRemoteUrl", ""),
   keepLocalModelLoaded: readBoolean("keepLocalModelLoaded", false),
+  unloadTranscriptionModelWhenIdle: readBoolean("unloadTranscriptionModelWhenIdle", false),
 
   meetingTranscriptionMode: (() => {
     const v = readString("meetingTranscriptionMode", "openwhispr");
@@ -2111,6 +2115,7 @@ export const useSettingsStore = create<SettingsState>()((set, get) => ({
   setCleanupMode: createStringSetter("cleanupMode") as (mode: InferenceMode) => void,
   setCleanupRemoteUrl: createStringSetter("cleanupRemoteUrl"),
   setKeepLocalModelLoaded: createBooleanSetter("keepLocalModelLoaded"),
+  setUnloadTranscriptionModelWhenIdle: createBooleanSetter("unloadTranscriptionModelWhenIdle"),
 
   setMeetingTranscriptionMode: createStringSetter("meetingTranscriptionMode") as (
     mode: InferenceMode
