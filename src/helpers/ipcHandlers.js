@@ -4,7 +4,11 @@ const {
   listRunnableLocalModels,
 } = require("../models/registryData.js");
 const { isLocalModelPolicyRefusal } = require("./localModelPolicyGate");
-const { transcribeWithDictionary } = require("./localWhisperDictionary");
+const {
+  transcribeWithDictionary,
+  createMeetingPromptContext,
+  transcribeMeetingChunkWithPrompt,
+} = require("./localWhisperDictionary");
 const { OrukeetStreaming, MANAGED_STREAM_OPTIONS } = require("./orukeetStreaming");
 const { connectManagedOrukeet } = require("./orukeetCloudSession");
 const {
@@ -9422,6 +9426,7 @@ class IPCHandlers {
     let meetingLocalMode = false;
     let meetingLocalBuffers = { mic: [], system: [] };
     const meetingLocalChunkClock = createLocalChunkClock();
+    const meetingLocalPromptContext = createMeetingPromptContext();
     let meetingLocalTimer = null;
     let meetingLocalWin = null;
     let meetingLocalTranscript = "";
@@ -9879,18 +9884,25 @@ class IPCHandlers {
             language: meetingLocalLanguage,
           });
         }
-        return this.whisperManager.transcribeLocalWhisper(wav, {
-          model: meetingLocalModel,
-          language: meetingLocalLanguage,
-          // Keep whisper.cpp's default decoder thresholds on this continuous
-          // load: the raised #1458 values multiply temperature-fallback
-          // re-decodes, and meeting chunks already have RMS-gate, VAD, and
-          // holdback/dedup hallucination protection.
-          skipDecoderThresholds: true,
-          // Each whisper segment becomes its own row with its own capture time.
-          segments: true,
-          ...this._resolveWhisperVadOptions("meeting"),
-        });
+        // Dictionary + the end of this source's previous chunk as the prompt.
+        return transcribeMeetingChunkWithPrompt(
+          this.whisperManager,
+          wav,
+          {
+            model: meetingLocalModel,
+            language: meetingLocalLanguage,
+            // Keep whisper.cpp's default decoder thresholds on this continuous
+            // load: the raised #1458 values multiply temperature-fallback
+            // re-decodes, and meeting chunks already have RMS-gate, VAD, and
+            // holdback/dedup hallucination protection.
+            skipDecoderThresholds: true,
+            // Each whisper segment becomes its own row with its own capture time.
+            segments: true,
+            ...this._resolveWhisperVadOptions("meeting"),
+          },
+          this._getDictionarySafe(),
+          meetingLocalPromptContext.get(source)
+        );
       };
 
       try {
@@ -9954,6 +9966,9 @@ class IPCHandlers {
               meetingLocalWin.webContents.send(channel, payload);
             }
           };
+
+          // Only text that is actually delivered primes the next chunk.
+          meetingLocalPromptContext.remember(source, chunkText);
 
           // Each segment starts when its audio was captured, as on the streaming
           // path (speech start), so diarization and live speaker windows line up
@@ -10120,6 +10135,7 @@ class IPCHandlers {
       meetingLocalMode = false;
       meetingLocalBuffers = { mic: [], system: [] };
       meetingLocalChunkClock.reset();
+      meetingLocalPromptContext.reset();
       if (meetingDiarizationStream) {
         meetingDiarizationStream.end();
         meetingDiarizationStream = null;
@@ -10825,6 +10841,7 @@ class IPCHandlers {
           meetingLocalWin = BrowserWindow.fromWebContents(event.sender);
           meetingLocalBuffers = { mic: [], system: [] };
           meetingLocalChunkClock.reset();
+          meetingLocalPromptContext.reset();
           meetingLocalTranscript = "";
 
           await startLiveSpeakerIdentification(meetingLocalWin, systemAudioMode);
