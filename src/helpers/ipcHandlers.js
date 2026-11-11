@@ -4393,6 +4393,10 @@ class IPCHandlers {
       );
     });
 
+    ipcMain.handle("whisper-server-warm", async (event, modelName) => {
+      return this.whisperManager.warmForDictation(modelName);
+    });
+
     ipcMain.handle("whisper-server-stop", async () => {
       return this.whisperManager.stopServer();
     });
