@@ -219,9 +219,11 @@ const {
 } = require("./transcriptText");
 const {
   applyConfirmedSpeaker,
+  applySpeakerName,
   applySuggestedSpeaker,
   canAutoRelabelSpeaker,
 } = require("./speakerAssignmentPolicy");
+const { assignSpeakersBySentence } = require("./sentenceSpeakers");
 const { normalizeStoredSpeakerCount } = require("./speakerCount");
 const {
   buildSpeakerRenumber,
@@ -8521,13 +8523,15 @@ class IPCHandlers {
       source,
       timestamp,
       micSuppression = null,
-      timestampIsSpeechStart = true
+      timestampIsSpeechStart = true,
+      endTimestamp = undefined
     ) => {
       meetingDiarizationSegments.push({
         text,
         source,
         timestamp,
         ...(timestampIsSpeechStart === false ? { timestampIsSpeechStart: false } : {}),
+        ...(Number.isFinite(endTimestamp) ? { endTimestamp } : {}),
         committedAt: Date.now(),
         suppressionReason: source === "mic" ? micSuppression?.reason || null : null,
         hasBleedEvidence: source === "mic" ? !!micSuppression?.hasBleedEvidence : false,
@@ -8540,6 +8544,7 @@ class IPCHandlers {
       source,
       timestamp,
       timestampIsSpeechStart = true,
+      endTimestamp = undefined,
       micSuppression = null,
       send = null,
       includeInLocalTranscript = false,
@@ -8553,7 +8558,8 @@ class IPCHandlers {
         source,
         timestamp,
         micSuppression,
-        timestampIsSpeechStart
+        timestampIsSpeechStart,
+        endTimestamp
       );
 
       if (send) {
@@ -9977,6 +9983,7 @@ class IPCHandlers {
             text,
             timestamp: segTimestamp,
             timestampIsSpeechStart,
+            endTimestamp,
           } of toLocalMeetingSegments(result, chunkStartedAt, chunkDurationMs)) {
             if (
               source === "mic" &&
@@ -10033,6 +10040,7 @@ class IPCHandlers {
                     source,
                     timestamp: segTimestamp,
                     timestampIsSpeechStart,
+                    endTimestamp,
                     micSuppression,
                     send: sendLocalSegment,
                     includeInLocalTranscript: true,
@@ -10046,6 +10054,7 @@ class IPCHandlers {
               source,
               timestamp: segTimestamp,
               timestampIsSpeechStart,
+              endTimestamp,
               micSuppression,
               send: sendLocalSegment,
               includeInLocalTranscript: true,
@@ -14740,7 +14749,7 @@ class IPCHandlers {
                   for (const seg of segments) {
                     if (seg.speaker === emb.speaker_id && !seg.speakerName) {
                       if (canAutoRelabelSpeaker(seg)) {
-                        applyConfirmedSpeaker(seg, {
+                        applySpeakerName(seg, {
                           speakerName: profile.display_name,
                           speakerIsPlaceholder: false,
                         });
@@ -14820,7 +14829,7 @@ class IPCHandlers {
           if (!unmappedSystemSpeakers.has(seg.speaker)) continue;
           if (seg.speakerName && !seg.speakerIsPlaceholder) continue;
           if (canAutoRelabelSpeaker(seg)) {
-            applyConfirmedSpeaker(seg, { speakerName: displayName, speakerIsPlaceholder: false });
+            applySpeakerName(seg, { speakerName: displayName, speakerIsPlaceholder: false });
           } else {
             seg.speakerName = displayName;
             seg.speakerIsPlaceholder = false;
@@ -14857,7 +14866,7 @@ class IPCHandlers {
         continue;
       }
 
-      applyConfirmedSpeaker(segment, {
+      applySpeakerName(segment, {
         speakerName: displayName,
         speakerIsPlaceholder: false,
         suggestedName: undefined,
@@ -15041,14 +15050,12 @@ class IPCHandlers {
       transcriptSegments[0]?.timestamp ||
       0;
     const isEpochMs = startMs > 1e9;
+    const toSeconds = (value) =>
+      value != null ? (isEpochMs ? (value - startMs) / 1000 : value) : undefined;
     const normalized = transcriptSegments.map((seg) => ({
       ...seg,
-      timestamp:
-        seg.timestamp != null
-          ? isEpochMs
-            ? (seg.timestamp - startMs) / 1000
-            : seg.timestamp
-          : undefined,
+      timestamp: toSeconds(seg.timestamp),
+      endTimestamp: toSeconds(seg.endTimestamp),
     }));
 
     // Split before any send so diarized, skipped and failed runs drop the same
@@ -15070,8 +15077,14 @@ class IPCHandlers {
           sessionId,
           noteId,
           ...payload,
+          // Matching metadata stays in the main process; endTimestamp is in seconds
+          // here, while the renderer and exports read it as epoch ms.
           segments: payload.segments.map(
-            ({ timestampIsSpeechStart: _timestampIsSpeechStart, ...segment }) => segment
+            ({
+              timestampIsSpeechStart: _timestampIsSpeechStart,
+              endTimestamp: _endTimestamp,
+              ...segment
+            }) => segment
           ),
           removedSegments,
         });
@@ -15184,11 +15197,33 @@ class IPCHandlers {
           similarity
         );
 
-        const enrichedSegments = this.diarizationManager.mergeWithTranscript(
+        let enrichedSegments = this.diarizationManager.mergeWithTranscript(
           kept,
           diarizationSegments,
           { diarizedSource, speakerIndexBase }
         );
+
+        // Each line gets its own voice: a short reply no longer inherits the turn
+        // around it. Lines whose voice is a close call stay provisional.
+        let sentenceVoices = null;
+        if (speakerEmb.isAvailable() && tmpWav) {
+          let reader = null;
+          try {
+            reader = speakerEmb.openWindowReader(tmpWav);
+            const result = await assignSpeakersBySentence(enrichedSegments, {
+              diarizedSource,
+              embedWindow: reader.embed,
+            });
+            if (result.refined) {
+              enrichedSegments = result.segments;
+              sentenceVoices = result.voices;
+            }
+          } catch (err) {
+            debugLogger.warn("Per-line speaker assignment skipped", { error: err.message });
+          } finally {
+            reader?.close();
+          }
+        }
 
         const speakerSet = new Set(diarizationSegments.map((d) => d.speaker));
         const speakerRenumber = buildSpeakerRenumber(speakerSet, speakerIndexBase);
@@ -15208,7 +15243,14 @@ class IPCHandlers {
 
         let speakerEmbeddingsMap = null;
         try {
-          if (!micSingleClusterSoftened && speakerEmb.isAvailable() && tmpWav) {
+          if (!micSingleClusterSoftened && sentenceVoices?.size) {
+            // Already keyed by the renumbered ids on the lines, and taken from
+            // sure lines only.
+            speakerEmbeddingsMap = {};
+            for (const [spk, voice] of sentenceVoices) {
+              speakerEmbeddingsMap[spk] = Array.from(voice);
+            }
+          } else if (!micSingleClusterSoftened && speakerEmb.isAvailable() && tmpWav) {
             const voices = await speakerEmb.extractClusterCentroids(tmpWav, diarizationSegments);
             speakerEmbeddingsMap = {};
             for (const [spk, centroid] of voices) {
@@ -15232,7 +15274,7 @@ class IPCHandlers {
         if (liveSpeakersSplit) {
           for (const segment of enrichedSegments) {
             if (segment.source === diarizedSource) {
-              applyConfirmedSpeaker(segment, { speakerName: null });
+              applySpeakerName(segment, { speakerName: null });
             }
           }
         }
@@ -15274,7 +15316,7 @@ class IPCHandlers {
                   continue;
                 }
                 if (match.confirmed) {
-                  applyConfirmedSpeaker(seg, {
+                  applySpeakerName(seg, {
                     speakerName: match.profile.display_name,
                     speakerIsPlaceholder: false,
                     suggestedName: undefined,
